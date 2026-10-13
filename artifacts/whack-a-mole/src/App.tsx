@@ -537,7 +537,7 @@ function Home() {
             <span>A little game by</span>
             <a
               className="creator-link"
-              href="https://github.com/olympus-mons26/whack-a-mole"
+              href="https://github.com/olympus-mons26/whackamole-game"
               target="_blank"
               rel="noopener noreferrer"
               data-testid="link-creator"

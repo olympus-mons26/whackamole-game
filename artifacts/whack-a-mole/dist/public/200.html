@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <script>
+      try {
+        const theme = localStorage.getItem('whack-a-mole-theme');
+        if (theme !== 'light') document.documentElement.classList.add('dark');
+      } catch {
+        document.documentElement.classList.add('dark');
+      }
+    </script>
+    <title>Whack-a-mole</title>
+    <meta name="theme-color" content="#28231f" />
+    <meta name="description" content="Play Whack-a-mole in a quick 30- or 60-second round. Choose a level and catch each mole before it disappears." />
+    <meta name="robots" content="index, follow" />
+    <meta property="og:title" content="Whack-a-mole" />
+    <meta property="og:description" content="Play Whack-a-mole in a quick 30- or 60-second round. Choose a level and catch each mole before it disappears." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Whack-a-mole" />
+    <meta name="twitter:description" content="Play Whack-a-mole in a quick 30- or 60-second round. Choose a level and catch each mole before it disappears." />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <script type="module" crossorigin src="/assets/index-BnGul9nH.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-DO3XQ3Nz.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

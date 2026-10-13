@@ -44,7 +44,7 @@ pnpm --filter @workspace/whack-a-mole run serve
 
 ## Credits
 
-Made by [olympus-mons26](https://github.com/olympus-mons26/whack-a-mole).
+Made by [olympus-mons26](https://github.com/olympus-mons26/whackamole-game).
 
 Thank you to [Surge](https://surge.sh) for free web hosting.
 
