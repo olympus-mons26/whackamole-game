@@ -1,0 +1,2 @@
+import{purry as e}from"./purry.js";import{n as t}from"./utilityEvaluators-IxVD3t2o.js";function n(...t){return e(r,t,i)}const r=(e,t)=>e.length<t.length?e.map((e,n)=>[e,t[n]]):t.map((t,n)=>[e[n],t]),i=e=>e.length===0?t:(t,n)=>({hasNext:!0,next:[t,e[n]],done:n>=e.length-1});export{n as zip};
+//# sourceMappingURL=zip.js.map

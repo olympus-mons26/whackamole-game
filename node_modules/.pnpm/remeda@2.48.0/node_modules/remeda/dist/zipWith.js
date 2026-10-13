@@ -1,0 +1,2 @@
+import{t as e}from"./lazyDataLastImpl--3B10z3s.js";import{n as t}from"./utilityEvaluators-IxVD3t2o.js";function n(t,n,a){return typeof t==`function`?(e,n)=>r(e,n,t):typeof n==`function`?e(r,[t,n],i):r(t,n,a)}function r(e,t,n){let r=[e,t];return e.length<t.length?e.map((e,i)=>n(e,t[i],i,r)):t.map((t,i)=>n(e[i],t,i,r))}const i=(e,n)=>e.length===0?t:(t,r,i)=>({next:n(t,e[r],r,[i,e]),hasNext:!0,done:r>=e.length-1});export{n as zipWith};
+//# sourceMappingURL=zipWith.js.map

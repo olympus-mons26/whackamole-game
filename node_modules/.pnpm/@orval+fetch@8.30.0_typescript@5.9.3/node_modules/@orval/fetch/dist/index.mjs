@@ -1,0 +1,409 @@
+import { GetterPropType, camel, emitResponseValidation, generateBodyOptions, generateFormDataAndUrlEncodedFunction, generateVerbImports, getSchemaOutputTypeRef, getSchemaValueRef, hasSchemaImport, isObject, isPrimitiveResponseType, jsStringLiteralEscape, makeRouteSafe, pascal, resolveRef, rewriteImportsForResponseValidation, stringify, toObjectString } from "@orval/core";
+//#region src/index.ts
+const WILDCARD_STATUS_CODE_REGEX = /^[1-5]XX$/i;
+const resolveSchemaRef = (schema, context) => resolveRef(schema, context);
+const getStatusCodeType = (key) => {
+	if (WILDCARD_STATUS_CODE_REGEX.test(key)) return `HTTPStatusCode${key[0]}xx`;
+	return key;
+};
+const FETCH_DEPENDENCIES = [{
+	exports: [{
+		name: "z",
+		alias: "zod",
+		values: true
+	}],
+	dependency: "zod"
+}];
+/** Returns the list of generator dependencies required by the fetch client (e.g. zod). */
+const getFetchDependencies = () => FETCH_DEPENDENCIES;
+const isRawRequestBodyContentType = (contentType) => contentType === "text/plain";
+const getRequestOptionsType = (mutator) => {
+	if (!mutator || !mutator.hasSecondArg) return "options?: RequestInit";
+	return mutator.isHook ? `options?: Parameters<ReturnType<typeof ${mutator.name}>>[1]` : `options?: Parameters<typeof ${mutator.name}>[1]`;
+};
+/**
+* Generates the URL helper function and the fetch request function for a single
+* OpenAPI operation. Handles query-param serialization (explode, arrayFormat,
+* paramsSerializer), request body encoding, response parsing, and optional
+* runtime Zod validation.
+*/
+const generateRequestFunction = ({ queryParams, headers, operationName, typeName, response, mutator, body, props, verb, fetchReviver, formData, formUrlEncoded, override, doc, paramsSerializer, params }, { route: _route, context, pathRoute }) => {
+	let route = _route;
+	if (context.output.urlEncodeParameters) {
+		const skip = new Set(params.filter((p) => p.allowReserved).map((p) => p.name));
+		route = makeRouteSafe(route, skip);
+	}
+	const isRequestOptions = override.requestOptions !== false;
+	const isFormData = !override.formData.disabled;
+	const isFormUrlEncoded = override.formUrlEncoded !== false;
+	const GET_HEADERS_HELPER = `  const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+`;
+	const getUrlFnName = camel(`get-${operationName}-url`);
+	const getUrlFnProps = toObjectString(props.filter((prop) => prop.type === GetterPropType.PARAM || prop.type === GetterPropType.NAMED_PATH_PARAMS || prop.type === GetterPropType.QUERY_PARAM), "implementation");
+	const spec = context.spec.paths?.[pathRoute];
+	const parameters = [...spec?.parameters ?? [], ...spec?.[verb]?.parameters ?? []];
+	const parameterObjects = [...new Map(parameters.map((parameter) => {
+		const { schema } = resolveRef(parameter, context);
+		const parameterObject = schema;
+		return [`${parameterObject.in}:${parameterObject.in === "header" ? parameterObject.name?.toLowerCase() : parameterObject.name}`, parameterObject];
+	})).values()];
+	const arrayFormat = override.fetch.arrayFormat;
+	const isArrayLikeParam = (parameterObject) => {
+		if (!parameterObject.schema) return false;
+		const { schema: schemaObject } = resolveSchemaRef(parameterObject.schema, context);
+		return schemaObject.type === "array" || (schemaObject.oneOf ?? []).some((s) => resolveSchemaRef(s, context).schema.type === "array") || (schemaObject.anyOf ?? []).some((s) => resolveSchemaRef(s, context).schema.type === "array") || (schemaObject.allOf ?? []).some((s) => resolveSchemaRef(s, context).schema.type === "array");
+	};
+	const explodeParameters = parameterObjects.filter((parameterObject) => parameterObject.in === "query" && isArrayLikeParam(parameterObject) && (parameterObject.style ?? "form") === "form" && (parameterObject.explode ?? true) && !(arrayFormat && parameterObject.explode === void 0));
+	const arrayFormatParameters = arrayFormat ? parameterObjects.filter((parameterObject) => parameterObject.in === "query" && isArrayLikeParam(parameterObject) && parameterObject.explode === void 0) : [];
+	const explodeParametersNames = explodeParameters.map((parameter) => parameter.name);
+	const arrayFormatParametersNames = arrayFormatParameters.map((parameter) => parameter.name);
+	const hasExplodedDateParams = context.output.override.useDates && explodeParameters.some((parameter) => {
+		if (!parameter.schema) return false;
+		const { schema } = resolveSchemaRef(parameter.schema, context);
+		return schema.format === "date-time";
+	});
+	const hasArrayFormatDateParams = context.output.override.useDates && arrayFormatParameters.some((parameter) => {
+		if (!parameter.schema) return false;
+		const { schema } = resolveSchemaRef(parameter.schema, context);
+		return schema.format === "date-time";
+	});
+	const explodeArrayImplementation = explodeParameters.length > 0 ? `const explodeParameters = ${JSON.stringify(explodeParametersNames)};
+
+    if (Array.isArray(value) && explodeParameters.includes(key)) {
+      value.forEach((v) => {
+        normalizedParams.append(key, v === null ? 'null' : ${hasExplodedDateParams ? "v instanceof Date ? v.toISOString() : " : ""}String(v));
+      });
+      return;
+    }
+      ` : "";
+	const arrayFormatImplementation = arrayFormatParameters.length > 0 ? `const arrayFormatParameters = ${JSON.stringify(arrayFormatParametersNames)};
+
+    if (Array.isArray(value) && arrayFormatParameters.includes(key)) {
+      ${arrayFormat === "repeat" ? `value.forEach((v) => { normalizedParams.append(key, v === null ? 'null' : ${hasArrayFormatDateParams ? "v instanceof Date ? v.toISOString() : " : ""}String(v)); });` : arrayFormat === "brackets" ? `value.forEach((v) => { normalizedParams.append(key + '[]', v === null ? 'null' : ${hasArrayFormatDateParams ? "v instanceof Date ? v.toISOString() : " : ""}String(v)); });` : `normalizedParams.append(key, value.map((v) => v === null ? 'null' : ${hasArrayFormatDateParams ? "v instanceof Date ? v.toISOString() : " : ""}String(v)).join(','));`}
+      return;
+    }
+      ` : "";
+	const deepObjectParameters = parameterObjects.filter((parameterObject) => parameterObject.in === "query" && parameterObject.style === "deepObject");
+	const deepObjectParameterNames = deepObjectParameters.map((parameter) => parameter.name);
+	const hasDeepObjectDateParams = context.output.override.useDates && deepObjectParameters.some((parameter) => {
+		if (!parameter.schema) return false;
+		const { schema } = resolveSchemaRef(parameter.schema, context);
+		if (!schema.properties) return false;
+		return Object.values(schema.properties).some((prop) => {
+			const { schema: propSchema } = resolveSchemaRef(prop, context);
+			return propSchema.format === "date-time";
+		});
+	});
+	const deepObjectImplementation = deepObjectParameters.length > 0 ? `const deepObjectParameters = ${JSON.stringify(deepObjectParameterNames)};
+
+    if (typeof value === 'object' && value !== null && !Array.isArray(value) && deepObjectParameters.includes(key)) {
+      Object.entries(value).forEach(([subKey, subValue]) => {
+        if (subValue !== undefined) {
+          deepObjectEntries.push(encodeURIComponent(key) + '[' + encodeURIComponent(subKey) + ']=' + (subValue === null ? 'null' : encodeURIComponent(${hasDeepObjectDateParams ? "subValue instanceof Date ? subValue.toISOString() : " : ""}String(subValue))));
+        }
+      });
+      return;
+    }
+      ` : "";
+	const isExplodeParametersOnly = explodeParameters.length + arrayFormatParameters.length + deepObjectParameters.length === parameterObjects.filter((p) => p.in === "query").length;
+	const normalParamsImplementation = `if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : ${context.output.override.useDates && parameterObjects.some((parameter) => {
+		if (!parameter.schema) return false;
+		const { schema } = resolveSchemaRef(parameter.schema, context);
+		return schema.format === "date-time";
+	}) ? "value instanceof Date ? value.toISOString() : " : ""}String(value))
+    }`;
+	const getUrlFnImplementation = paramsSerializer ? `export const ${getUrlFnName} = (${getUrlFnProps}) => {
+${queryParams ? `  const stringifiedParams = ${paramsSerializer.name}(params);` : ""}
+
+  ${queryParams ? `return stringifiedParams.length > 0 ? \`${route}?\${stringifiedParams}\` : \`${route}\`` : `return \`${route}\``}
+}\n` : `export const ${getUrlFnName} = (${getUrlFnProps}) => {
+${queryParams ? `  const normalizedParams = new URLSearchParams();
+${deepObjectParameters.length > 0 ? "  const deepObjectEntries: string[] = [];\n" : ""}
+  Object.entries(params || {}).forEach(([key, value]) => {
+    ${explodeArrayImplementation}${arrayFormatImplementation}${deepObjectImplementation}
+    ${isExplodeParametersOnly ? "" : normalParamsImplementation}
+  });` : ""}
+
+  ${queryParams ? deepObjectParameters.length > 0 ? `const stringifiedParams = [normalizedParams.toString(), deepObjectEntries.join('&')].filter(Boolean).join('&');` : `const stringifiedParams = normalizedParams.toString();` : ``}
+
+  ${queryParams ? `return stringifiedParams.length > 0 ? \`${route}?\${stringifiedParams}\` : \`${route}\`` : `return \`${route}\``}
+}\n`;
+	const isContentTypeNdJson = (contentType) => contentType === "application/nd-json" || contentType === "application/x-ndjson";
+	const isContentTypeJson = (contentType) => contentType.toLowerCase().includes("json");
+	const isNdJson = response.contentTypes.some((contentType) => isContentTypeNdJson(contentType));
+	const isBlob = response.isBlob;
+	const successContentTypes = response.types.success.map((t) => t.contentType).filter(Boolean);
+	const errorContentTypes = response.types.errors.map((t) => t.contentType).filter(Boolean);
+	const parseTimeContentTypes = override.fetch.forceSuccessResponse ? successContentTypes : [...successContentTypes, ...errorContentTypes];
+	const successHasJson = parseTimeContentTypes.some((ct) => isContentTypeJson(ct));
+	const successHasNonJson = parseTimeContentTypes.some((ct) => !isContentTypeJson(ct));
+	const hasMixedSuccessContentTypes = successHasJson && successHasNonJson;
+	const successAlwaysJson = parseTimeContentTypes.length === 0 || successHasJson && !successHasNonJson;
+	const errorHasJson = errorContentTypes.some((ct) => isContentTypeJson(ct));
+	const errorHasNonJson = errorContentTypes.some((ct) => !isContentTypeJson(ct));
+	const hasMixedErrorContentTypes = errorHasJson && errorHasNonJson;
+	const errorAlwaysJson = errorContentTypes.length === 0 || errorHasJson && !errorHasNonJson;
+	const responseTypeName = fetchResponseTypeName(override.fetch.includeHttpResponseReturnType, isNdJson ? "Response" : response.definition.success, typeName);
+	const responseType = response.definition.success;
+	const isVoidResponse = responseType === "void";
+	const isPrimitiveType = isPrimitiveResponseType(responseType);
+	const hasSchema = hasSchemaImport(response.imports, responseType);
+	const isValidateResponse = override.fetch.runtimeValidation.enabled && !isPrimitiveType && hasSchema && !isNdJson;
+	const isZodSchemasOutput = isObject(context.output.schemas) && context.output.schemas.type === "zod";
+	const useValidatedOutputType = isValidateResponse && isZodSchemasOutput && !mutator;
+	const allResponses = [...response.types.success, ...response.types.errors];
+	if (allResponses.length === 0) allResponses.push({
+		contentType: "",
+		hasReadonlyProps: false,
+		imports: [],
+		isEnum: false,
+		isRef: false,
+		key: "default",
+		schemas: [],
+		type: "unknown",
+		value: "unknown",
+		dependencies: []
+	});
+	const nonDefaultStatuses = allResponses.filter((r) => r.key !== "default").map((r) => getStatusCodeType(r.key));
+	const uniqueNonDefaultStatuses = [...new Set(nonDefaultStatuses)];
+	const responseDataTypes = allResponses.map((r) => allResponses.filter((r2) => r2.key === r.key).length > 1 ? {
+		...r,
+		suffix: pascal(r.contentType)
+	} : r).map((r) => {
+		const name = `${responseTypeName}${pascal(r.key)}${"suffix" in r ? r.suffix : ""}`;
+		const isSuccessEntry = response.types.success.some((s) => s.key === r.key);
+		const rawDataType = r.value || "unknown";
+		const dataType = useValidatedOutputType && isSuccessEntry && rawDataType === responseType && !isContentTypeNdJson(r.contentType) && (r.contentType === "" || isContentTypeJson(r.contentType)) ? getSchemaOutputTypeRef(responseType) : rawDataType;
+		return {
+			name,
+			success: isSuccessEntry,
+			value: `export type ${name} = {
+  ${isContentTypeNdJson(r.contentType) ? `stream: TypedResponse<${dataType}>` : `data: ${dataType}`}
+  status: ${r.key === "default" ? uniqueNonDefaultStatuses.length > 0 ? `Exclude<HTTPStatusCodes, ${uniqueNonDefaultStatuses.join(" | ")}>` : "number" : getStatusCodeType(r.key)}
+}`
+		};
+	});
+	const successName = `${responseTypeName}Success`;
+	const errorName = `${responseTypeName}Error`;
+	const hasSuccess = responseDataTypes.some((r) => r.success);
+	const hasError = responseDataTypes.some((r) => !r.success);
+	const responseHeadersType = override.fetch.serializeResponseHeaders ? "Record<string, string>" : "Headers";
+	const responseTypeImplementation = override.fetch.includeHttpResponseReturnType ? `${responseDataTypes.map((r) => r.value).join("\n\n")}
+
+${hasSuccess ? `export type ${successName} = (${responseDataTypes.filter((r) => r.success).map((r) => r.name).join(" | ")}) & {
+  headers: ${responseHeadersType};
+}` : ""};
+${hasError ? `export type ${errorName} = (${responseDataTypes.filter((r) => !r.success).map((r) => r.name).join(" | ")}) & {
+  headers: ${responseHeadersType};
+}` : ""};
+
+${override.fetch.forceSuccessResponse && hasSuccess ? "" : `export type ${responseTypeName} = (${hasError && hasSuccess ? `${successName} | ${errorName}` : hasSuccess ? successName : errorName})\n\n`}` : "";
+	const getUrlFnProperties = props.filter((prop) => prop.type === GetterPropType.PARAM || prop.type === GetterPropType.QUERY_PARAM || prop.type === GetterPropType.NAMED_PATH_PARAMS).map((param) => {
+		return param.type === GetterPropType.NAMED_PATH_PARAMS ? param.destructured : param.name;
+	}).join(",");
+	const useRuntimeFetcher = override.fetch.useRuntimeFetcher;
+	const fetchFnParam = useRuntimeFetcher && isRequestOptions && !mutator ? ", fetchFn?: typeof globalThis.fetch" : "";
+	const args = `${toObjectString(props, "implementation")} ${isRequestOptions ? getRequestOptionsType(mutator) : ""}${fetchFnParam}`;
+	const innerType = override.fetch.forceSuccessResponse && hasSuccess && override.fetch.includeHttpResponseReturnType ? successName : useValidatedOutputType && !override.fetch.includeHttpResponseReturnType ? getSchemaOutputTypeRef(responseType) : responseTypeName;
+	const returnType = mutator?.inferred ? innerType : `Promise<${innerType}>`;
+	const fetchMethodOption = `method: '${verb.toUpperCase()}'`;
+	const ignoreContentTypes = ["multipart/form-data"];
+	const overrideHeaders = isObject(override.requestOptions) && override.requestOptions.headers ? Object.entries(override.requestOptions.headers).map(([key, value]) => `'${key}': \`${value}\``) : [];
+	const headersToAdd = [
+		...body.contentType && !ignoreContentTypes.includes(body.contentType) ? [`'Content-Type': '${jsStringLiteralEscape(body.contentType)}'`] : [],
+		...isNdJson && response.contentTypes.length === 1 ? [`Accept: ${response.contentTypes[0] === "application/x-ndjson" ? "'application/x-ndjson'" : "'application/nd-json'"}`] : [],
+		...overrideHeaders,
+		...headers ? ["...headers"] : []
+	];
+	let globalFetchOptions;
+	if (isObject(override.requestOptions)) {
+		const shouldMergeFetchOptionHeaders = headersToAdd.length > 0 && "headers" in override.requestOptions;
+		const globalFetchOptionsObject = { ...override.requestOptions };
+		if (shouldMergeFetchOptionHeaders && override.requestOptions.headers) delete globalFetchOptionsObject.headers;
+		globalFetchOptions = stringify(globalFetchOptionsObject)?.slice(1, -1).trim();
+	} else globalFetchOptions = "";
+	const fetchHeadersOption = headersToAdd.length > 0 ? `headers: { ${headersToAdd.join(",")}, ...getHeaders(options?.headers) }` : "";
+	const requestBodyParams = generateBodyOptions(body, isFormData, isFormUrlEncoded);
+	const fetchBodyOption = requestBodyParams ? isFormData && body.formData || isFormUrlEncoded && body.formUrlEncoded || body.isBlob || isRawRequestBodyContentType(body.contentType) ? `body: ${requestBodyParams}` : `body: JSON.stringify(${requestBodyParams})` : "";
+	const schemaValueRef = getSchemaValueRef(responseType);
+	const responseValidationExpression = emitResponseValidation({
+		schemaRef: schemaValueRef,
+		operationName,
+		strategy: override.fetch.runtimeValidation.strategy,
+		context: "fetch-assign",
+		inputExpression: "parsedBody"
+	});
+	const includeZodSchema = isValidateResponse && context.output.override.includeZodSchemaInArguments && isObject(context.output.schemas) && context.output.schemas.type === "zod";
+	const getFetchFnOptions = ({ withSchema = false } = {}) => {
+		const fetchSchemaOption = withSchema && includeZodSchema ? `schema: ${schemaValueRef}` : "";
+		return `${getUrlFnName}(${getUrlFnProperties}),
+  {${globalFetchOptions ? "\n" : ""}      ${globalFetchOptions}
+    ${isRequestOptions ? "...options," : ""}
+    ${fetchMethodOption}${fetchHeadersOption ? "," : ""}
+    ${fetchHeadersOption}${fetchBodyOption ? "," : ""}
+    ${fetchBodyOption}${fetchSchemaOption ? `,\n    ${fetchSchemaOption}` : ""}
+  }
+`;
+	};
+	const fetchFnOptions = getFetchFnOptions();
+	const mutatorFetchFnOptions = getFetchFnOptions({ withSchema: true });
+	const reviver = fetchReviver ? `, ${fetchReviver.name}` : "";
+	const fetchResponseType = override.fetch.forceSuccessResponse && hasSuccess && override.fetch.includeHttpResponseReturnType ? successName : responseTypeName;
+	const errorBodyExpression = hasMixedErrorContentTypes ? `errorBody ? (errorContentType.includes('json') ? JSON.parse(errorBody${reviver}) : errorBody) : {}` : errorAlwaysJson ? `errorBody ? JSON.parse(errorBody${reviver}) : {}` : `errorBody !== null ? errorBody : {}`;
+	const throwOnErrorBodyExpression = hasMixedErrorContentTypes ? `body ? (errorContentType.includes('json') ? JSON.parse(body${reviver}) : body) : {}` : errorAlwaysJson ? `body ? JSON.parse(body${reviver}) : {}` : `body !== null ? body : ''`;
+	const throwOnErrorDataExpression = isNdJson ? `body ? JSON.parse(body${reviver}) : {}` : isBlob ? errorBodyExpression : throwOnErrorBodyExpression;
+	const throwOnErrorInnerDeclarations = isNdJson ? "const body = [204, 205, 304].includes(stream.status) ? null : await stream.text();" : isBlob ? `const errorBody = [204, 205, 304].includes(res.status) ? null : await res.text();
+    ${hasMixedErrorContentTypes ? `const errorContentType = (res.headers.get('content-type') ?? '').toLowerCase();` : ""}` : override.fetch.forceSuccessResponse ? hasMixedErrorContentTypes ? `const errorContentType = (res.headers.get('content-type') ?? '').toLowerCase();` : "" : hasMixedErrorContentTypes ? `const errorContentType = (res.headers.get('content-type') ?? '').toLowerCase();
+    const body = [204, 205, 304].includes(res.status) ? null : await res.text();` : "const body = [204, 205, 304].includes(res.status) ? null : await res.text();";
+	const throwOnErrorImplementation = `if (!${isNdJson ? "stream" : "res"}.ok) {
+    ${throwOnErrorInnerDeclarations}
+    const err: globalThis.Error & {info?: ${hasError ? `${override.fetch.includeHttpResponseReturnType ? `${errorName}['data']` : responseTypeName}` : "any"}, status?: number} = new globalThis.Error();
+    const data ${hasError ? `: ${override.fetch.includeHttpResponseReturnType ? `${errorName}['data']` : responseTypeName}` : ""} = ${throwOnErrorDataExpression}
+    err.info = data;
+    err.status = ${isNdJson ? "stream" : "res"}.status;
+    throw err;
+  }`;
+	const fetchFnCall = useRuntimeFetcher && isRequestOptions ? "(fetchFn ?? fetch)" : "fetch";
+	const responseHeadersValue = (responseVarName) => override.fetch.serializeResponseHeaders ? `Object.fromEntries([...${responseVarName}.headers.entries()].filter(([name]) => name !== 'set-cookie'))` : `${responseVarName}.headers`;
+	const blobFetchResponseImplementation = `const res = await ${fetchFnCall}(${fetchFnOptions})
+
+  ${override.fetch.forceSuccessResponse ? throwOnErrorImplementation : ""}
+  const body = [204, 205, 304].includes(res.status) ? null : await res.blob();
+  const data: ${fetchResponseType}${override.fetch.includeHttpResponseReturnType ? `['data']` : ""} = body as ${fetchResponseType}${override.fetch.includeHttpResponseReturnType ? `['data']` : ""}
+  ${override.fetch.includeHttpResponseReturnType ? `return { data, status: res.status, headers: ${responseHeadersValue("res")} } as ${fetchResponseType}` : "return data"}
+`;
+	const fetchResponseImplementation = isNdJson ? `  const stream = await ${fetchFnCall}(${fetchFnOptions});
+  ${override.fetch.forceSuccessResponse ? throwOnErrorImplementation : ""}
+  ${override.fetch.includeHttpResponseReturnType ? `return { status: stream.status, stream, headers: ${responseHeadersValue("stream")} } as ${fetchResponseType}` : `return stream`}
+  ` : isBlob ? blobFetchResponseImplementation : `const res = await ${fetchFnCall}(${fetchFnOptions})
+
+  ${hasMixedSuccessContentTypes || isValidateResponse && successAlwaysJson ? `const contentType = (res.headers.get('content-type') ?? '').toLowerCase();` : ""}
+  const body = [204, 205, 304].includes(res.status) ? null : await res.text();
+  ${override.fetch.forceSuccessResponse ? throwOnErrorImplementation : ""}
+  ${isValidateResponse ? hasMixedSuccessContentTypes ? `const parsedBody = body ? (contentType.includes('json') ? JSON.parse(body${reviver}) : body) : {}
+  const data = contentType.includes('json') ? ${responseValidationExpression} : parsedBody` : successAlwaysJson ? `const parsedBody = body ? (contentType.includes('json') ? JSON.parse(body${reviver}) : body) : {}
+  const data = contentType.includes('json') ? ${responseValidationExpression} : parsedBody` : `const parsedBody = body !== null ? body : ''
+  const data = parsedBody` : hasMixedSuccessContentTypes ? `const data: ${fetchResponseType}${override.fetch.includeHttpResponseReturnType ? `['data']` : ""} = body ? (contentType.includes('json') ? JSON.parse(body${reviver}) : body) : ${isVoidResponse ? "undefined" : "{}"}` : successAlwaysJson ? `const data: ${fetchResponseType}${override.fetch.includeHttpResponseReturnType ? `['data']` : ""} = body ? JSON.parse(body${reviver}) : ${isVoidResponse ? "undefined" : "{}"}` : `const data: ${fetchResponseType}${override.fetch.includeHttpResponseReturnType ? `['data']` : ""} = body !== null ? body : ${isVoidResponse ? "undefined" : "''"}`}
+  ${override.fetch.includeHttpResponseReturnType ? `return { data, status: res.status, headers: ${responseHeadersValue("res")} } as ${fetchResponseType}` : "return data"}
+`;
+	let customFetchResponseImplementation = `return ${mutator?.name}<${fetchResponseType}>(${mutatorFetchFnOptions});`;
+	const bodyForm = generateFormDataAndUrlEncodedFunction({
+		formData,
+		formUrlEncoded,
+		body,
+		isFormData,
+		isFormUrlEncoded
+	});
+	if (mutator?.isHook) {
+		const hasDefaultName = !mutator.path.includes("#");
+		const fetchExportName = hasDefaultName ? "customFetcher" : mutator.path.split("#")[1];
+		customFetchResponseImplementation = `
+      const ${hasDefaultName ? `customFetcher` : `{${fetchExportName}}`} = ${mutator.name}();
+      return (${args}) => {
+        ${bodyForm}
+        return ${fetchExportName}(${mutatorFetchFnOptions});
+      }
+  `;
+	}
+	const fetchImplementationBody = mutator ? customFetchResponseImplementation : fetchResponseImplementation;
+	let fetchImplementation = `export const ${operationName} = ${mutator?.inferred ? "" : "async "}(${args})${mutator?.inferred ? "" : `: ${returnType}`} => {
+  ${bodyForm ? `  ${bodyForm}` : ""}
+  ${fetchHeadersOption ? GET_HEADERS_HELPER : ""}${fetchImplementationBody}}
+  `;
+	if (mutator?.isHook) fetchImplementation = `export const use${pascal(operationName)}Hook = (): (${args}) => ${mutator.inferred ? "{" : `${returnType} => {`}
+    ${fetchHeadersOption ? GET_HEADERS_HELPER : ""}${fetchImplementationBody}}
+  `;
+	return responseTypeImplementation + `${getUrlFnImplementation}\n${doc}${fetchImplementation}\n`;
+};
+/**
+* Derives the TypeScript response type name for a fetch operation.
+* Returns the operation-scoped name when `includeHttpResponseReturnType` is
+* enabled, otherwise falls back to the success response definition name.
+*/
+const fetchResponseTypeName = (includeHttpResponseReturnType, definitionSuccessResponse, typeName) => {
+	return includeHttpResponseReturnType ? `${typeName}Response` : definitionSuccessResponse;
+};
+/** Builds the full fetch client output (imports + implementation) for one verb. */
+const generateClient = (verbOptions, options) => {
+	const isZodOutput = typeof options.context.output.schemas === "object" && options.context.output.schemas.type === "zod";
+	const responseType = verbOptions.response.definition.success;
+	const isNdJsonResponse = verbOptions.response.contentTypes.some((contentType) => contentType === "application/nd-json" || contentType === "application/x-ndjson");
+	const normalizedVerbOptions = verbOptions.override.fetch.runtimeValidation.enabled && isZodOutput && !isNdJsonResponse && !isPrimitiveResponseType(responseType) && hasSchemaImport(verbOptions.response.imports, responseType) ? {
+		...verbOptions,
+		response: {
+			...verbOptions.response,
+			imports: rewriteImportsForResponseValidation(verbOptions.response.imports, responseType, { includeOutputType: !verbOptions.mutator })
+		}
+	} : verbOptions;
+	const imports = generateVerbImports(normalizedVerbOptions);
+	return {
+		implementation: `${generateRequestFunction(normalizedVerbOptions, options)}\n`,
+		imports,
+		docComment: ""
+	};
+};
+const HTTP_STATUS_CODE_SHARED_TYPES = [
+	{
+		name: "HTTPStatusCode1xx",
+		exported: true,
+		code: "type HTTPStatusCode1xx = 100 | 101 | 102 | 103;"
+	},
+	{
+		name: "HTTPStatusCode2xx",
+		exported: true,
+		code: "type HTTPStatusCode2xx = 200 | 201 | 202 | 203 | 204 | 205 | 206 | 207;"
+	},
+	{
+		name: "HTTPStatusCode3xx",
+		exported: true,
+		code: "type HTTPStatusCode3xx = 300 | 301 | 302 | 303 | 304 | 305 | 307 | 308;"
+	},
+	{
+		name: "HTTPStatusCode4xx",
+		exported: true,
+		code: "type HTTPStatusCode4xx = 400 | 401 | 402 | 403 | 404 | 405 | 406 | 407 | 408 | 409 | 410 | 411 | 412 | 413 | 414 | 415 | 416 | 417 | 418 | 419 | 420 | 421 | 422 | 423 | 424 | 426 | 428 | 429 | 431 | 451;"
+	},
+	{
+		name: "HTTPStatusCode5xx",
+		exported: true,
+		code: "type HTTPStatusCode5xx = 500 | 501 | 502 | 503 | 504 | 505 | 507 | 511;"
+	},
+	{
+		name: "HTTPStatusCodes",
+		exported: true,
+		code: "type HTTPStatusCodes = HTTPStatusCode1xx | HTTPStatusCode2xx | HTTPStatusCode3xx | HTTPStatusCode4xx | HTTPStatusCode5xx;"
+	}
+];
+/** Emits HTTP status-code union types at the top of the generated file when they are needed. */
+const generateFetchHeader = ({ clientImplementation }) => {
+	if (!/HTTPStatusCode[1-5]xx|<HTTPStatusCodes,/.test(clientImplementation)) return "";
+	return {
+		implementation: "",
+		sharedTypes: HTTP_STATUS_CODE_SHARED_TYPES
+	};
+};
+const fetchClientBuilder = {
+	client: generateClient,
+	header: generateFetchHeader,
+	dependencies: getFetchDependencies
+};
+/** Returns the fetch client builder factory used by orval's plugin system. */
+const builder = () => () => fetchClientBuilder;
+//#endregion
+export { builder, builder as default, fetchResponseTypeName, generateClient, generateFetchHeader, generateRequestFunction, getFetchDependencies };
+
+//# sourceMappingURL=index.mjs.map
