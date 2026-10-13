@@ -117,10 +117,10 @@ Then open `http://localhost:5173` in your browser.
 
 ## Credits
 
-Made by [olympus-mons26](https://github.com/olympus-mons26/whack-a-mole).
+Made by [olympus-mons26](https://github.com/olympus-mons26/whackamole-game).
 
 ---
 
 ## License
 
-MIT
+GNU General Public License v3.0 (GPLv3)
